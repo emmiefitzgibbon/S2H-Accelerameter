@@ -191,4 +191,3 @@ Examples:
     args = parser.parse_args()
     
     plot_accelerometer_data(csv_file=args.csv_file, start_time=args.start, end_time=args.end)
-

@@ -2,20 +2,44 @@
 # encoding: utf-8
 
 import numpy as np
-import matplotlib.pyplot as plt
-import json
 import time
 import threading
 import sys
 import csv
 import os
 import struct
-from multiprocessing import Process
 from serial_control import serial_control
+try:
+    from serial.tools import list_ports
+except ImportError:
+    list_ports = None
 
 class AccelerationAnalyzer:
 
-    def __init__(self, port1, port2=None, sensor1_name="Sensor_0x53", sensor2_name="Sensor_0x1D", save_only_sensor1=False):
+    def __init__(self, port1, port2, sensor1_name="Sensor_0x53", sensor2_name="Sensor_0x1D", save_only_sensor1=False):
+        # Print available serial ports
+        print("\n" + "="*60)
+        print("Serial Port Detection:")
+        if list_ports:
+            available_ports = list_ports.comports()
+            if available_ports:
+                print("Available serial ports:")
+                for port in available_ports:
+                    print(f"  - {port.device}: {port.description}")
+            else:
+                print("No serial ports found")
+        else:
+            print("serial.tools.list_ports not available - install pyserial to see available ports")
+        print("="*60)
+        
+        # Print which ports are being used
+        print(f"\n[Sensor 1] Using port: {port1} ({sensor1_name})")
+        if port2:
+            print(f"[Sensor 2] Using port: {port2} ({sensor2_name})")
+        else:
+            print(f"[Sensor 2] No port specified (single sensor mode)")
+        print()
+        
         self.control1 = serial_control(port1)
         self.sensor1_name = sensor1_name
         self.port1 = port1
@@ -32,18 +56,43 @@ class AccelerationAnalyzer:
         self.save_only_sensor1 = save_only_sensor1
 
         # Sensor 2 data (if provided)
-        if port2:
-            self.control2 = serial_control(port2)
-            self.sensor2_name = sensor2_name
-            self.port2 = port2
+        if port2 and str(port2).strip():
+            try:
+                self.control2 = serial_control(port2)
+                self.sensor2_name = sensor2_name
+                self.port2 = port2
+                self.all_data2 = []
+                self.all_data_timestamps2 = []
+                self.buffer2 = []
+                self.buffer_timestamps2 = []
+                self.baseline_acc2 = None
+                self.is_baseline_valid2 = False
+                print(f"[Sensor 2] Successfully connected to {port2}")
+            except Exception as e:
+                error_msg = str(e)
+                if "Resource busy" in error_msg or "could not open port" in error_msg:
+                    print(f"[ERROR] Failed to connect to Sensor 2 port {port2}")
+                    print(f"        Port is busy - another program may be using it.")
+                    print(f"        Try closing other serial monitor programs or check with: lsof | grep {port2}")
+                    print(f"        Sensor 2 data will NOT be collected.")
+                else:
+                    print(f"[ERROR] Failed to connect to Sensor 2 port {port2}: {e}")
+                self.control2 = None
+                self.all_data2 = []
+                self.all_data_timestamps2 = []
+                self.buffer2 = []
+                self.buffer_timestamps2 = []
+                self.baseline_acc2 = None
+                self.is_baseline_valid2 = False
+        else:
+            self.control2 = None
+            # Initialize empty lists even if port2 is not provided (for safety)
             self.all_data2 = []
             self.all_data_timestamps2 = []
             self.buffer2 = []
             self.buffer_timestamps2 = []
             self.baseline_acc2 = None
             self.is_baseline_valid2 = False
-        else:
-            self.control2 = None
         
         if self.save_only_sensor1:
             print("[Performance] Only saving data from Sensor 1 (Sensor 2 will be received but not saved)")
@@ -51,12 +100,30 @@ class AccelerationAnalyzer:
         # Common settings
         self.buffer_size = 500
         self.frame_count = 0
+        self.packets_received = 0
+        self.last_status_time = time.time()
+        self.packets_dropped = 0  # Track potential dropped packets
+        self.last_timestamp = None
 
         # Trial status tracking: list of (timestamp, status) tuples
         # Timestamps are stored in sensor time scale (not system time)
         self.trial_status_history = []
         self.current_trial_status = None
         self.time_offset = None  # Offset between sensor time and system time (sensor_time = system_time - offset)
+        
+        # Timestamp synchronization between sensors
+        self.sensor1_first_timestamp = None
+        self.sensor2_first_timestamp = None
+        self.timestamp_offset_s2_to_s1 = None  # Offset to convert sensor 2 timestamps to sensor 1's time scale
+        
+        # Lock to prevent status messages from interfering with input
+        self.print_lock = threading.Lock()
+        
+        # Lock for thread-safe data access (though list.append is mostly atomic)
+        self.data_lock = threading.Lock()
+        
+        # Flag to stop data collection threads
+        self.running = True
 
         # Print instructions
         print("\n" + "="*60)
@@ -68,51 +135,106 @@ class AccelerationAnalyzer:
         # Start terminal input handler in a separate thread
         self.input_thread = threading.Thread(target=self.handle_terminal_input, daemon=True)
         self.input_thread.start()
+        
+        # Start data reception threads for each sensor
+        self.sensor1_thread = threading.Thread(target=self.receive_sensor_data, args=(1,), daemon=True)
+        self.sensor1_thread.start()
+        
+        if self.control2:
+            self.sensor2_thread = threading.Thread(target=self.receive_sensor_data, args=(2,), daemon=True)
+            self.sensor2_thread.start()
 
         self.loop()
 
     def loop(self):
         try:
             self.last_time = time.time()
-            while True :
-                # Receive data from both sensors - optimized tight loop
-                self.receive_data()
-                self.frame_count = self.frame_count + 1
-                # Reduced plot frequency to every 200 frames for less overhead
-                if self.frame_count == 200:
-                    if not self.is_baseline_valid1:
-                        self.baseline_calculate(1)
-                    if self.control2 and not self.is_baseline_valid2:
+            baseline_calculated = False
+            
+            while True:
+                # Data reception is now handled by separate threads
+                # Main loop just handles baseline calculation and status updates
+                
+                # Calculate baseline once after collecting some data
+                if not baseline_calculated and len(self.buffer1) >= 100:
+                    self.baseline_calculate(1)
+                    if self.control2 and len(self.buffer2) >= 100:
                         self.baseline_calculate(2)
-                    self.frame_count = 0
-                    self.graph_plot()
+                    baseline_calculated = True
+                
+                # Print status every 5 seconds (use newline to avoid interfering with input)
+                current_time = time.time()
+                if current_time - self.last_status_time >= 5.0:
+                    elapsed = current_time - (self.last_status_time - 5.0)
+                    rate = self.packets_received / elapsed if elapsed > 0 else 0
+                    with self.print_lock:
+                        sensor2_info = f", Sensor 2: {len(self.all_data2)}" if self.control2 else ""
+                        print(f"[Status] Packets: {self.packets_received}, Sensor 1: {len(self.all_data1)}{sensor2_info}, Rate: {rate:.0f} Hz, Dropped: {self.packets_dropped}")
+                    self.last_status_time = current_time
+                
+                # Small sleep to prevent busy-waiting
+                time.sleep(0.001)
 
         except KeyboardInterrupt:
+            self.running = False  # Signal threads to stop
+            time.sleep(0.1)  # Give threads a moment to finish
+            
             self.control1.finish()
             if self.control2:
                 self.control2.finish()
-            print(self.frame_count)
+            print(f"\n[Final] Total packets received: {self.packets_received}")
+            print(f"[Final] Sensor 1 data points: {len(self.all_data1)}")
+            if self.control2:
+                print(f"[Final] Sensor 2 data points: {len(self.all_data2)}")
+            print(f"[Final] Estimated packets dropped: {self.packets_dropped}")
+            if len(self.all_data_timestamps1) > 1:
+                time_span = (self.all_data_timestamps1[-1] - self.all_data_timestamps1[0]) / 1000000.0
+                print(f"[Final] Time span: {time_span:.2f} seconds")
             self.save_data()
             print("data saved!")
         print("End...")
 
-    def receive_data(self):
-        # Receive from sensor 1
+    def receive_sensor_data(self, sensor_num):
+        """Thread function to continuously receive data from a single sensor"""
+        if sensor_num == 1:
+            control = self.control1
+            sensor_name = self.sensor1_name
+        elif sensor_num == 2:
+            control = self.control2
+            sensor_name = self.sensor2_name
+        else:
+            return
+        
+        packets_received_count = 0
+        
         try:
-            input_bytes = self.control1.receive()
-            if input_bytes:
-                self.processing_data(input_bytes, 1)
+            while self.running:
+                try:
+                    # Process ALL available packets as fast as possible
+                    while True:
+                        input_bytes = control.receive()
+                        if input_bytes:
+                            packets_received_count += 1
+                            # Debug first few packets for sensor 2
+                            if sensor_num == 2 and packets_received_count <= 3:
+                                print(f"[Sensor 2] Received packet {packets_received_count}, length: {len(input_bytes)} bytes")
+                            self.processing_data(input_bytes, sensor_num)
+                        else:
+                            break  # No more packets available
+                    
+                    # Small sleep to prevent 100% CPU usage when no data available
+                    time.sleep(0.0001)
+                    
+                except Exception as e:
+                    print(f'{sensor_name} data error = ', e)
+                    import traceback
+                    traceback.print_exc()
+                    time.sleep(0.01)  # Brief pause before retrying
+                    
         except Exception as e:
-            print(f'{self.sensor1_name} data error = ', e)
-
-        # Receive from sensor 2 (if available)
-        if self.control2:
-            try:
-                input_bytes = self.control2.receive()
-                if input_bytes:
-                    self.processing_data(input_bytes, 2)
-            except Exception as e:
-                print(f'{self.sensor2_name} data error = ', e)
+            print(f'{sensor_name} thread error = ', e)
+            import traceback
+            traceback.print_exc()
 
     def processing_data(self, input_bytes, sensor_num):
         try:
@@ -122,10 +244,29 @@ class AccelerationAnalyzer:
             # Parse binary packet: [4 bytes: timestamp (uint32_t, microseconds)] [4 bytes: X (float)] [4 bytes: Y (float)] [4 bytes: Z (float)]
             timestamp, x, y, z = struct.unpack('<Ifff', input_bytes)  # Little-endian: uint32_t, float, float, float
             
+            # Validate data - check for reasonable values
+            # Accelerometer values should typically be in range -20 to +20 g
+            # Timestamps should be reasonable (not wrapping around)
+            if abs(x) > 100 or abs(y) > 100 or abs(z) > 100:
+                # Data looks corrupted, skip it
+                return
+            
             accel_data = [x, y, z]
             
             # Timestamp is in microseconds from Arduino micros()
             timestamp_us = timestamp
+            
+            # Detect dropped packets by checking for large timestamp gaps
+            if self.last_timestamp is not None and sensor_num == 1:
+                time_diff = timestamp_us - self.last_timestamp
+                # At 3200 Hz, we expect ~312.5 microseconds between packets
+                # If gap is > 1000 us, we likely dropped packets
+                if time_diff > 1000:
+                    estimated_dropped = int((time_diff - 312.5) / 312.5)
+                    self.packets_dropped += max(0, estimated_dropped)
+            
+            if sensor_num == 1:
+                self.last_timestamp = timestamp_us
             
             # Calculate time offset on first data point to sync with system time
             # This allows trial_status timestamps to match sensor timestamps
@@ -136,165 +277,89 @@ class AccelerationAnalyzer:
                 self.time_offset = system_time - (timestamp_us / 1000000.0)
                 print(f"[Time Sync] Offset calculated: sensor_time = system_time - {self.time_offset:.3f}")
                 print(f"[Time Sync] First sensor timestamp: {timestamp_us} us (Arduino micros)")
+            
+            # Track first timestamps from each sensor for synchronization
+            if sensor_num == 1 and self.sensor1_first_timestamp is None:
+                self.sensor1_first_timestamp = timestamp_us
+            elif sensor_num == 2 and self.sensor2_first_timestamp is None:
+                self.sensor2_first_timestamp = timestamp_us
+                # If we have both first timestamps, calculate offset
+                if self.sensor1_first_timestamp is not None and self.timestamp_offset_s2_to_s1 is None:
+                    # Calculate offset: sensor2_time + offset = sensor1_time
+                    # We'll align sensor 2 to sensor 1's time scale
+                    self.timestamp_offset_s2_to_s1 = self.sensor1_first_timestamp - self.sensor2_first_timestamp
+                    print(f"[Time Sync] Sensor timestamp alignment:")
+                    print(f"  Sensor 1 first timestamp: {self.sensor1_first_timestamp} us")
+                    print(f"  Sensor 2 first timestamp: {self.sensor2_first_timestamp} us")
+                    print(f"  Offset (s2->s1): {self.timestamp_offset_s2_to_s1} us")
+                    print(f"  Sensor 2 timestamps will be adjusted by {self.timestamp_offset_s2_to_s1} us to align with Sensor 1")
 
-            if sensor_num == 1:
-                self.all_data1.append(accel_data)
-                self.all_data_timestamps1.append(timestamp_us)  # Store in microseconds
-                self.buffer1.append(accel_data)
-                self.buffer_timestamps1.append(timestamp_us)
-                if len(self.buffer1) > self.buffer_size:
-                    self.buffer1.pop(0)
-                    self.buffer_timestamps1.pop(0)
-            elif sensor_num == 2:
-                # Only save sensor 2 data if save_only_sensor1 flag is False
-                if not self.save_only_sensor1:
-                    self.all_data2.append(accel_data)
-                    self.all_data_timestamps2.append(timestamp_us)  # Store in microseconds
-                # Still update buffer for plotting even if not saving
-                self.buffer2.append(accel_data)
-                self.buffer_timestamps2.append(timestamp_us)
-                if len(self.buffer2) > self.buffer_size:
-                    self.buffer2.pop(0)
-                    self.buffer_timestamps2.pop(0)
+            # Use lock for thread-safe list operations
+            with self.data_lock:
+                if sensor_num == 1:
+                    self.all_data1.append(accel_data)
+                    self.all_data_timestamps1.append(timestamp_us)  # Store in microseconds
+                    self.buffer1.append(accel_data)
+                    self.buffer_timestamps1.append(timestamp_us)
+                    if len(self.buffer1) > self.buffer_size:
+                        self.buffer1.pop(0)
+                        self.buffer_timestamps1.pop(0)
+                    self.packets_received += 1
+                elif sensor_num == 2:
+                    # Only save sensor 2 data if save_only_sensor1 flag is False
+                    if not self.save_only_sensor1:
+                        self.all_data2.append(accel_data)
+                        self.all_data_timestamps2.append(timestamp_us)  # Store in microseconds
+                        # Debug: print first few sensor 2 data points
+                        if len(self.all_data2) <= 5:
+                            print(f"[Sensor 2] Received data point {len(self.all_data2)}: {accel_data}, timestamp: {timestamp_us}")
+                    # Still update buffer for baseline calculation even if not saving
+                    self.buffer2.append(accel_data)
+                    self.buffer_timestamps2.append(timestamp_us)
+                    if len(self.buffer2) > self.buffer_size:
+                        self.buffer2.pop(0)
+                        self.buffer_timestamps2.pop(0)
+                    if not self.save_only_sensor1:
+                        self.packets_received += 1
         except Exception as e:
             print(f'error processing data from sensor {sensor_num}: {input_bytes}')
 
     def baseline_calculate(self, sensor_num):
         if sensor_num == 1:
-            acc_array = np.array(self.buffer1)
-            self.baseline_acc1 = np.mean(acc_array, axis=0)
-            print(f'{self.sensor1_name} baseline:', self.baseline_acc1)
+            with self.data_lock:
+                acc_array = np.array(self.buffer1)
+            # Filter out corrupted data (values > 100 g are clearly wrong)
+            valid_mask = np.all(np.abs(acc_array) < 100, axis=1)
+            if np.sum(valid_mask) < 50:  # Need at least 50 valid points
+                print(f'{self.sensor1_name} WARNING: Not enough valid data for baseline ({np.sum(valid_mask)} valid points)')
+                self.baseline_acc1 = np.array([0, 0, 0])
+            else:
+                valid_data = acc_array[valid_mask]
+                self.baseline_acc1 = np.mean(valid_data, axis=0)
+                print(f'{self.sensor1_name} baseline:', self.baseline_acc1)
             self.is_baseline_valid1 = True
         elif sensor_num == 2:
-            acc_array = np.array(self.buffer2)
-            self.baseline_acc2 = np.mean(acc_array, axis=0)
-            print(f'{self.sensor2_name} baseline:', self.baseline_acc2)
+            with self.data_lock:
+                acc_array = np.array(self.buffer2)
+            # Filter out corrupted data
+            valid_mask = np.all(np.abs(acc_array) < 100, axis=1)
+            if np.sum(valid_mask) < 50:
+                print(f'{self.sensor2_name} WARNING: Not enough valid data for baseline ({np.sum(valid_mask)} valid points)')
+                self.baseline_acc2 = np.array([0, 0, 0])
+            else:
+                valid_data = acc_array[valid_mask]
+                self.baseline_acc2 = np.mean(valid_data, axis=0)
+                print(f'{self.sensor2_name} baseline:', self.baseline_acc2)
             self.is_baseline_valid2 = True
 
-    def freq_plot(self):
-        plt.clf()
-
-        acc_array = np.array(self.buffer_fft)
-        acc_len = acc_array.shape[0]
-        # print(acc_array.shape)
-        acc_abs = np.linalg.norm(acc_array, axis=1)
-        # acc_abs = [np.sqrt(acc_array[i][0]*acc_array[i][0] + acc_array[i][1]*acc_array[i][1] + acc_array[i][2]*acc_array[i][2]) for i in range(acc_array.shape[0])]
-        # print(acc_abs.shape)
-
-        acc_fft = np.fft.fft(acc_abs)[1:acc_len>>1]
-        acc_freq = np.fft.fftfreq(acc_len, 1/acc_len)[1:acc_len>>1]
-
-        plt.plot(acc_freq, 2.0 / acc_len * np.abs(acc_fft))
-        plt.xlim(0, 400)
-        plt.ylim(0, 60)
-        plt.xticks(np.arange(0, 400, 20))
-        plt.pause(0.001)
-
-    def graph_plot(self):
-        plt.clf() # clear previous figure
-
-        if self.control2:
-            # Dual sensor display
-            # Sensor 1 plots
-            acc_array1 = np.array(self.buffer1)
-            if len(acc_array1) > 0:
-                if type(self.baseline_acc1) == type(acc_array1):
-                    for i in range(acc_array1.shape[0]):
-                        acc_array1[i] = np.round((acc_array1[i] - self.baseline_acc1), 2)
-                acc_abs1 = np.linalg.norm(acc_array1, axis=1)
-                acc_rms1 = np.round(np.sqrt(np.mean(acc_abs1**2)), 2)
-                acc_rms_axis1 = np.sqrt(np.mean(acc_array1**2, axis=0))
-
-                # Sensor 2 plots
-                acc_array2 = np.array(self.buffer2)
-                if len(acc_array2) > 0:
-                    if type(self.baseline_acc2) == type(acc_array2):
-                        for i in range(acc_array2.shape[0]):
-                            acc_array2[i] = np.round((acc_array2[i] - self.baseline_acc2), 2)
-                    acc_abs2 = np.linalg.norm(acc_array2, axis=1)
-                    acc_rms2 = np.round(np.sqrt(np.mean(acc_abs2**2)), 2)
-                    acc_rms_axis2 = np.sqrt(np.mean(acc_array2**2, axis=0))
-
-                # Plot Sensor 1 (top)
-                plt.subplot(221)
-                if len(acc_array1) > 0:
-                    x1 = np.arange(len(acc_array1))
-                    plt.plot(x1, acc_array1[:, 0], x1, acc_array1[:, 1], x1, acc_array1[:, 2])
-                    plt.legend(['x', 'y', 'z'])
-                    plt.axis([0, self.buffer_size, -50, 50])
-                    plt.ylabel("acceleration")
-                    plt.title(f'{self.sensor1_name} - MAX X={np.max(acc_array1[:, 0]):.2f} Y={np.max(acc_array1[:, 1]):.2f} Z={np.max(acc_array1[:, 2]):.2f}')
-
-                # Plot Sensor 1 magnitude
-                plt.subplot(223)
-                if len(acc_abs1) > 0:
-                    x1 = np.arange(len(acc_abs1))
-                    plt.plot(x1, acc_abs1)
-                    plt.axis([0, self.buffer_size, 0, 100])
-                    plt.xlabel("frame")
-                    plt.ylabel("acceleration")
-                    plt.title(f'{self.sensor1_name} - RMS: {acc_rms1}')
-
-                # Plot Sensor 2 (top right)
-                plt.subplot(222)
-                if len(acc_array2) > 0:
-                    x2 = np.arange(len(acc_array2))
-                    plt.plot(x2, acc_array2[:, 0], x2, acc_array2[:, 1], x2, acc_array2[:, 2])
-                    plt.legend(['x', 'y', 'z'])
-                    plt.axis([0, self.buffer_size, -50, 50])
-                    plt.ylabel("acceleration")
-                    plt.title(f'{self.sensor2_name} - MAX X={np.max(acc_array2[:, 0]):.2f} Y={np.max(acc_array2[:, 1]):.2f} Z={np.max(acc_array2[:, 2]):.2f}')
-
-                # Plot Sensor 2 magnitude
-                plt.subplot(224)
-                if len(acc_abs2) > 0:
-                    x2 = np.arange(len(acc_abs2))
-                    plt.plot(x2, acc_abs2)
-                    plt.axis([0, self.buffer_size, 0, 100])
-                    plt.xlabel("frame")
-                    plt.ylabel("acceleration")
-                    plt.title(f'{self.sensor2_name} - RMS: {acc_rms2}')
-
-                # Removed constant print to keep terminal clear for user input
-        else:
-            # Single sensor display (original)
-            acc_array = np.array(self.buffer1)
-            if len(acc_array) > 0:
-                if type(self.baseline_acc1) == type(acc_array):
-                    for i in range(acc_array.shape[0]):
-                        acc_array[i] = np.round((acc_array[i] - self.baseline_acc1), 2)
-                acc_abs = np.linalg.norm(acc_array, axis=1)
-                acc_rms = np.round(np.sqrt(np.mean(acc_abs**2)), 2)
-                acc_rms_axis = np.sqrt(np.mean(acc_array**2, axis=0))
-                # Removed constant print to keep terminal clear for user input
-
-                # wave
-                plt.subplot(211)
-                x = np.arange(acc_array.shape[0])
-                plt.plot(x, acc_array[:, 0], x, acc_array[:, 1], x, acc_array[:, 2])
-                plt.legend(['x', 'y', 'z'])
-                plt.axis([0, self.buffer_size, -50, 50])
-                plt.ylabel("acceleration")
-                display_text = 'MAX X='+str(np.max(acc_array[:, 0]))+' Y='+str(np.max(acc_array[:, 1]))+' Z='+str(np.max(acc_array[:, 2]))+'\n'+\
-                               'MIN X='+str(np.min(acc_array[:, 0]))+' Y='+str(np.min(acc_array[:, 1]))+' Z='+str(np.min(acc_array[:, 2]))
-                plt.title(display_text)
-                #Spectrum
-                plt.subplot(212)
-                plt.plot(x, acc_abs)
-                plt.axis([0, self.buffer_size, 0, 100])
-                plt.xlabel("frame")
-                plt.ylabel("acceleration")
-                display_text = 'Max ACC = '+str(acc_rms)
-                plt.title(display_text)
-
-        plt.pause(.001)
 
     def handle_terminal_input(self):
         """Handle terminal input commands in a separate thread"""
         while True:
             try:
-                # Prompt for input
-                user_input = input("Enter message: ").strip()
+                # Use lock to prevent status messages from interfering
+                with self.print_lock:
+                    user_input = input("Enter message: ").strip()
                 
                 # Only process non-empty input
                 if user_input:
@@ -305,20 +370,23 @@ class AccelerationAnalyzer:
                         sensor_timestamp_us = (system_time - self.time_offset) * 1000000  # Convert to microseconds
                         self.trial_status_history.append((sensor_timestamp_us, message))
                         self.current_trial_status = message
-                        print(f"[Trial Status] Set to: '{message}' at sensor time {sensor_timestamp_us:.1f} us")
+                        with self.print_lock:
+                            print(f"[Trial Status] Set to: '{message}' at sensor time {sensor_timestamp_us:.1f} us")
                     else:
                         # Store with system time, will be converted later when offset is known
                         system_time = time.time()
                         self.trial_status_history.append((system_time, message))
                         self.current_trial_status = message
-                        print(f"[Trial Status] Set to: '{message}' (will sync when data arrives)")
+                        with self.print_lock:
+                            print(f"[Trial Status] Set to: '{message}' (will sync when data arrives)")
                 # Ignore empty input
                     
             except EOFError:
                 # Handle case where stdin is closed
                 break
             except Exception as e:
-                print(f"[Trial Status] Error reading input: {e}")
+                with self.print_lock:
+                    print(f"[Trial Status] Error reading input: {e}")
                 break
 
     def get_trial_status_for_timestamp(self, timestamp):
@@ -337,20 +405,8 @@ class AccelerationAnalyzer:
         return status
 
     def get_next_filename(self):
-        """Find the next available filename to avoid overwriting existing data"""
-        base_name = 'acc_data'
-        extension = '.csv'
-        
-        # Check if base file exists
-        if not os.path.exists(f'{base_name}{extension}'):
-            return f'{base_name}{extension}'
-        
-        # Find the next available number
-        counter = 1
-        while os.path.exists(f'{base_name}({counter}){extension}'):
-            counter += 1
-        
-        return f'{base_name}({counter}){extension}'
+        """Return the base filename (will overwrite existing files)"""
+        return 'acc_data.csv'
 
     def save_data(self):
         # Convert any trial_status entries that were stored before time_offset was known
@@ -389,22 +445,33 @@ class AccelerationAnalyzer:
                 all_rows.append((timestamp, row))
         
         # Collect sensor 2 data
-        if self.control2 and len(self.all_data2) > 0:
-            for i in range(len(self.all_data2)):
-                baseline = self.baseline_acc2 if self.baseline_acc2 is not None else np.array([0, 0, 0])
-                timestamp = self.all_data_timestamps2[i]
-                trial_status = self.get_trial_status_for_timestamp(timestamp)
-                acc = np.round((self.all_data2[i] - baseline), 3)
-                
-                row = [
-                    self.sensor2_name,
-                    timestamp,
-                    acc[0],
-                    acc[1],
-                    acc[2],
-                    trial_status if trial_status is not None else ''
-                ]
-                all_rows.append((timestamp, row))
+        print(f"[Save Debug] control2 exists: {self.control2 is not None}, save_only_sensor1: {self.save_only_sensor1}, all_data2 length: {len(self.all_data2)}")
+        if self.control2 is not None and not self.save_only_sensor1:
+            print(f"[Save Debug] Sensor 2 condition passed, checking data length: {len(self.all_data2)}")
+            if len(self.all_data2) > 0:
+                print(f"[Save Debug] Saving {len(self.all_data2)} sensor 2 data points")
+                for i in range(len(self.all_data2)):
+                    baseline = self.baseline_acc2 if self.baseline_acc2 is not None else np.array([0, 0, 0])
+                    timestamp = self.all_data_timestamps2[i]
+                    # Apply timestamp offset to align sensor 2 with sensor 1's time scale
+                    if self.timestamp_offset_s2_to_s1 is not None:
+                        timestamp = timestamp + self.timestamp_offset_s2_to_s1
+                    trial_status = self.get_trial_status_for_timestamp(timestamp)
+                    acc = np.round((self.all_data2[i] - baseline), 3)
+                    
+                    row = [
+                        self.sensor2_name,
+                        timestamp,
+                        acc[0],
+                        acc[1],
+                        acc[2],
+                        trial_status if trial_status is not None else ''
+                    ]
+                    all_rows.append((timestamp, row))
+            else:
+                print(f"[Save Debug] WARNING: Sensor 2 has no data to save! (all_data2 is empty)")
+        else:
+            print(f"[Save Debug] Sensor 2 NOT being saved - control2: {self.control2 is not None}, save_only_sensor1: {self.save_only_sensor1}")
         
         # Sort all rows by timestamp to interleave sensors
         all_rows.sort(key=lambda x: x[0])
@@ -430,7 +497,7 @@ if __name__ == "__main__":
     # On macOS/Linux: '/dev/cu.usbmodem2101', '/dev/ttyUSB0', etc.
 
     PORT_SENSOR_1 = '/dev/cu.usbmodem101'  # Sensor at address 0x1D
-    PORT_SENSOR_2 = None   # Not used - single sensor setup
+    PORT_SENSOR_2 = '/dev/cu.usbmodem1101'   # Not used - single sensor setup
 
     # Single sensor setup - using Sensor 0x1D
     spec = AccelerationAnalyzer(
@@ -438,5 +505,5 @@ if __name__ == "__main__":
         port2=PORT_SENSOR_2,
         sensor1_name="Sensor_0x1D",
         sensor2_name="Sensor_0x53",
-        save_only_sensor1=True  # Only saving Sensor 1 (0x1D) data
+        save_only_sensor1=False  # Only saving Sensor 1 (0x1D) data
     )

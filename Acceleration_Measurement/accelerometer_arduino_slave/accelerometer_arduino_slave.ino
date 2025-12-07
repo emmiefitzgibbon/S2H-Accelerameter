@@ -191,7 +191,7 @@ void setup(void) {
   //  displayRange();
   //  Serial.println("");
   counter = 0;
-  lastTimestamp = millis();
+  lastTimestamp = micros();
   //  Serial.println(lastTimestamp);
 
   //  for(int i=0; i<samples; ++i){
